@@ -19,7 +19,8 @@
 //! `--art=DIR` (Cosmic Commando's `cosmic-commando-2d/images`; also found next to this repo or
 //! via `COSMIC_COMMANDO_IMAGES`), `--font=FILE` (a .ttf for the HUD; a system font otherwise).
 //!
-//! Controls: WASD / arrows / left stick to fly, mouse / right stick to aim, left mouse / Space /
+//! Controls: W / S (or up / down) thrust towards / away from where the ship points, A / D strafe,
+//! left stick flies on-screen directions, mouse / right stick to aim, left mouse / Space /
 //! right trigger to fire, wheel to zoom, F3 dev overlay, F1 collision shapes, P pause, Esc quit.
 
 use flux2d::assets::{Assets, system_font};
@@ -745,7 +746,7 @@ impl Shooter {
         p.cooldown -= dt;
 
         let input = &ctx.input;
-        let (mut thrust, mut aim, firing);
+        let (thrust, mut aim, firing);
         if self.o.autopilot {
             // Circle the origin, aim at the nearest enemy, always fire.
             let t = self.time * 0.35;
@@ -761,21 +762,17 @@ impl Shooter {
             aim = nearest.map_or(Vec2::NEG_Y, |b| (b.pos + b.vel * 0.15 - me).normalize_or_zero());
             firing = true;
         } else {
-            thrust = Vec2::ZERO;
+            // Keyboard flight is relative to the ship: W thrusts the way the nose points (where
+            // the mouse aims), S backs off, A and D strafe. The left stick stays twin-stick
+            // (push it the way you want to go on screen), which suits a gamepad better.
             let key = |a: KeyCode, b: KeyCode| input.key_down(a) || input.key_down(b);
-            if key(KeyCode::KeyA, KeyCode::ArrowLeft) {
-                thrust.x -= 1.0;
-            }
-            if key(KeyCode::KeyD, KeyCode::ArrowRight) {
-                thrust.x += 1.0;
-            }
-            if key(KeyCode::KeyW, KeyCode::ArrowUp) {
-                thrust.y -= 1.0;
-            }
-            if key(KeyCode::KeyS, KeyCode::ArrowDown) {
-                thrust.y += 1.0;
-            }
-            thrust = (thrust + input.left_stick()).clamp_length_max(1.0);
+            let axis = |neg: bool, pos: bool| f32::from(u8::from(pos)) - f32::from(u8::from(neg));
+            let forward = axis(key(KeyCode::KeyS, KeyCode::ArrowDown), key(KeyCode::KeyW, KeyCode::ArrowUp));
+            let strafe =
+                axis(key(KeyCode::KeyA, KeyCode::ArrowLeft), key(KeyCode::KeyD, KeyCode::ArrowRight));
+            let nose = Vec2::from_angle(p.body.rot - FRAC_PI_2);
+            let right = nose.perp(); // y down: the nose turned a quarter clockwise
+            thrust = (nose * forward + right * strafe + input.left_stick()).clamp_length_max(1.0);
             let mouse = ctx.camera.screen_to_world(input.mouse_position());
             aim = (mouse - p.body.pos).normalize_or(p.aim);
             let stick = input.right_stick();
@@ -1068,7 +1065,7 @@ impl Shooter {
         if !self.o.autopilot {
             small.draw_aligned(
                 batch,
-                "WASD / stick: fly   mouse / right stick: aim   click / Space / RT: fire   F3: overlay   F1: shapes   P: pause",
+                "W/S: thrust where you aim   A/D: strafe   mouse / right stick: aim   click / Space / RT: fire   F3: overlay   F1: shapes   P: pause",
                 Vec2::new(view.x * 0.5, view.y - 12.0),
                 Align::BOTTOM,
                 little.color([170, 180, 200, 200]),

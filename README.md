@@ -33,7 +33,9 @@ top right and centre, the hull bar top left.
 
 | Input | Does |
 | --- | --- |
-| WASD / arrows / left stick | fly |
+| W / S (or up / down) | thrust towards / away from where the ship points |
+| A / D (or left / right) | strafe sideways |
+| Left stick | fly in that direction on screen (twin-stick) |
 | Mouse / right stick | aim |
 | Left mouse / Space / right trigger / A | fire |
 | Mouse wheel | zoom |
