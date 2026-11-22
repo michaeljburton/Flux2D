@@ -8,10 +8,34 @@ use flux2d_render::{
 };
 use glam::Vec2;
 use image::{Rgba, RgbaImage};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 const W: u32 = 64;
 const H: u32 = 32;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+
+/// One GPU device for every test in this file, used by one test at a time.
+///
+/// Each test opening its own device in parallel crashed Mesa's software Vulkan driver
+/// (lavapipe) now and then on CI (SIGSEGV while several instances were created and torn down
+/// at once), so the tests share a device and take turns. `None` (and the test passes) when
+/// there is no adapter at all.
+fn shared_gpu() -> Option<(&'static Gpu, MutexGuard<'static, ()>)> {
+    static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
+    static TURN: Mutex<()> = Mutex::new(());
+    let turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let gpu = GPU.get_or_init(|| match pollster::block_on(Gpu::headless()) {
+        Ok(g) => {
+            eprintln!("adapter: {}", g.adapter_name());
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("skipping GPU tests: {e}");
+            None
+        }
+    });
+    gpu.as_ref().map(|g| (g, turn))
+}
 
 /// Renders with a camera that makes world units window pixels.
 fn render(gpu: &Gpu, renderer: &mut SpriteRenderer, batch: &SpriteBatch) -> RgbaImage {
@@ -96,22 +120,15 @@ fn close(a: Rgba<u8>, b: [u8; 4]) -> bool {
 
 #[test]
 fn sprites_draw_with_alpha_and_additive_blending() {
-    let gpu = match pollster::block_on(Gpu::headless()) {
-        Ok(g) => g,
-        Err(e) => {
-            eprintln!("skipping: {e}");
-            return;
-        }
-    };
-    eprintln!("adapter: {}", gpu.adapter_name());
+    let Some((gpu, _lock)) = shared_gpu() else { return };
 
     let mut atlas = AtlasBuilder::new();
     let white = atlas.add("white", RgbaImage::from_pixel(8, 8, Rgba([255, 255, 255, 255])));
     let half = atlas.add("half red", RgbaImage::from_pixel(8, 8, Rgba([255, 0, 0, 128])));
-    let atlas = atlas.build(&gpu).unwrap();
+    let atlas = atlas.build(gpu).unwrap();
 
-    let mut renderer = SpriteRenderer::new(&gpu, FORMAT);
-    renderer.set_atlas(&gpu, &atlas);
+    let mut renderer = SpriteRenderer::new(gpu, FORMAT);
+    renderer.set_atlas(gpu, &atlas);
 
     let mut batch = SpriteBatch::new();
     let w = atlas.region(white);
@@ -134,7 +151,7 @@ fn sprites_draw_with_alpha_and_additive_blending() {
         SpriteInstance::sized(&w, Vec2::new(52.0, 16.0), Vec2::splat(16.0), 0.0).with_color([0, 255, 0, 255]),
     );
 
-    let img = render(&gpu, &mut renderer, &batch);
+    let img = render(gpu, &mut renderer, &batch);
     assert!(close(*img.get_pixel(12, 16), [255, 0, 0, 255]), "opaque: {:?}", img.get_pixel(12, 16));
     assert!(close(*img.get_pixel(32, 16), [128, 0, 127, 255]), "alpha: {:?}", img.get_pixel(32, 16));
     assert!(close(*img.get_pixel(52, 16), [0, 255, 255, 255]), "additive: {:?}", img.get_pixel(52, 16));
@@ -145,12 +162,12 @@ fn sprites_draw_with_alpha_and_additive_blending() {
 
 #[test]
 fn rotation_turns_the_quad() {
-    let Ok(gpu) = pollster::block_on(Gpu::headless()) else { return };
+    let Some((gpu, _lock)) = shared_gpu() else { return };
     let mut atlas = AtlasBuilder::new();
     let white = atlas.add("white", RgbaImage::from_pixel(4, 4, Rgba([255, 255, 255, 255])));
-    let atlas = atlas.build(&gpu).unwrap();
-    let mut renderer = SpriteRenderer::new(&gpu, FORMAT);
-    renderer.set_atlas(&gpu, &atlas);
+    let atlas = atlas.build(gpu).unwrap();
+    let mut renderer = SpriteRenderer::new(gpu, FORMAT);
+    renderer.set_atlas(gpu, &atlas);
     let mut batch = SpriteBatch::new();
     // A 40x4 bar at the centre, turned a quarter turn: tall instead of wide.
     batch.push(
@@ -163,17 +180,17 @@ fn rotation_turns_the_quad() {
             std::f32::consts::FRAC_PI_2,
         ),
     );
-    let img = render(&gpu, &mut renderer, &batch);
+    let img = render(gpu, &mut renderer, &batch);
     assert!(close(*img.get_pixel(32, 2), [255, 255, 255, 255]), "{:?}", img.get_pixel(32, 2));
     assert!(close(*img.get_pixel(44, 16), [0, 0, 255, 255]), "{:?}", img.get_pixel(44, 16));
 }
 
 #[test]
 fn screen_space_ignores_the_camera_and_text_draws() {
-    let Ok(gpu) = pollster::block_on(Gpu::headless()) else { return };
-    let atlas = AtlasBuilder::new().build(&gpu).unwrap();
-    let mut renderer = SpriteRenderer::new(&gpu, FORMAT);
-    renderer.set_atlas(&gpu, &atlas);
+    let Some((gpu, _lock)) = shared_gpu() else { return };
+    let atlas = AtlasBuilder::new().build(gpu).unwrap();
+    let mut renderer = SpriteRenderer::new(gpu, FORMAT);
+    renderer.set_atlas(gpu, &atlas);
     let white = atlas.white();
 
     // A world camera far away, zoomed and turned: world sprites at the origin are off screen.
@@ -194,7 +211,7 @@ fn screen_space_ignores_the_camera_and_text_draws() {
     // Text at (32, 8) in the built-in font at its raster size: a white "#" (solid rows).
     atlas.debug_font().draw(&mut batch, "#", Vec2::new(32.0, 8.0), TextStyle::screen(16.0));
 
-    let img = render_with(&gpu, &mut renderer, &batch, &camera);
+    let img = render_with(gpu, &mut renderer, &batch, &camera);
     assert!(close(*img.get_pixel(8, 8), [255, 0, 0, 255]), "screen square: {:?}", img.get_pixel(8, 8));
     assert!(close(*img.get_pixel(13, 8), [0, 0, 255, 255]), "square is 8 px: {:?}", img.get_pixel(13, 8));
     let lit = (32..48)
