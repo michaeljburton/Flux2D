@@ -23,12 +23,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Software Vulkan driver (lavapipe) for the GPU tests
+      - name: Software Vulkan driver (lavapipe) for the GPU tests, udev (gamepads) and ALSA (audio) headers
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers libudev-dev libasound2-dev
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets
+      - name: Clippy without default features (no gamepads, no ECS)
+        run: cargo clippy -p flux2d --no-default-features --all-targets
       - name: Tests
         run: cargo test --workspace -- --nocapture

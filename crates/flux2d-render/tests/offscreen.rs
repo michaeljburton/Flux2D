@@ -3,7 +3,9 @@
 //! Needs a GPU adapter. CI uses Mesa's software Vulkan driver (lavapipe); on a machine with no
 //! adapter at all the test prints why and passes, so `cargo test` still works anywhere.
 
-use flux2d_render::{AtlasBuilder, Blend, Camera2D, Gpu, SpriteBatch, SpriteInstance, SpriteRenderer, wgpu};
+use flux2d_render::{
+    AtlasBuilder, Blend, Camera2D, Gpu, SpriteBatch, SpriteInstance, SpriteRenderer, TextStyle, wgpu,
+};
 use glam::Vec2;
 use image::{Rgba, RgbaImage};
 
@@ -11,7 +13,19 @@ const W: u32 = 64;
 const H: u32 = 32;
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Renders with a camera that makes world units window pixels.
 fn render(gpu: &Gpu, renderer: &mut SpriteRenderer, batch: &SpriteBatch) -> RgbaImage {
+    let mut camera = Camera2D::new(Vec2::new(W as f32, H as f32));
+    camera.position = Vec2::new(W as f32 / 2.0, H as f32 / 2.0); // world = pixels
+    render_with(gpu, renderer, batch, &camera)
+}
+
+fn render_with(
+    gpu: &Gpu,
+    renderer: &mut SpriteRenderer,
+    batch: &SpriteBatch,
+    camera: &Camera2D,
+) -> RgbaImage {
     let target = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("test target"),
         size: wgpu::Extent3d { width: W, height: H, depth_or_array_layers: 1 },
@@ -23,9 +37,7 @@ fn render(gpu: &Gpu, renderer: &mut SpriteRenderer, batch: &SpriteBatch) -> Rgba
         view_formats: &[],
     });
     let view = target.create_view(&Default::default());
-    let mut camera = Camera2D::new(Vec2::new(W as f32, H as f32));
-    camera.position = Vec2::new(W as f32 / 2.0, H as f32 / 2.0); // world = pixels
-    let upload = renderer.prepare(gpu, batch, &camera);
+    let upload = renderer.prepare(gpu, batch, camera);
     assert_eq!(upload.sprites as usize, batch.len());
 
     let bytes_per_row = 256; // >= W * 4, aligned to COPY_BYTES_PER_ROW_ALIGNMENT
@@ -154,4 +166,41 @@ fn rotation_turns_the_quad() {
     let img = render(&gpu, &mut renderer, &batch);
     assert!(close(*img.get_pixel(32, 2), [255, 255, 255, 255]), "{:?}", img.get_pixel(32, 2));
     assert!(close(*img.get_pixel(44, 16), [0, 0, 255, 255]), "{:?}", img.get_pixel(44, 16));
+}
+
+#[test]
+fn screen_space_ignores_the_camera_and_text_draws() {
+    let Ok(gpu) = pollster::block_on(Gpu::headless()) else { return };
+    let atlas = AtlasBuilder::new().build(&gpu).unwrap();
+    let mut renderer = SpriteRenderer::new(&gpu, FORMAT);
+    renderer.set_atlas(&gpu, &atlas);
+    let white = atlas.white();
+
+    // A world camera far away, zoomed and turned: world sprites at the origin are off screen.
+    let mut camera = Camera2D::new(Vec2::new(W as f32, H as f32));
+    camera.position = Vec2::new(5000.0, -300.0);
+    camera.zoom = 3.0;
+    camera.rotation = 0.5;
+
+    let mut batch = SpriteBatch::new();
+    batch.push(0, Blend::Alpha, SpriteInstance::sized(&white, Vec2::new(10.0, 10.0), Vec2::splat(8.0), 0.0));
+    // Screen space: a red 8x8 square centred on pixel (8, 8), whatever the camera does.
+    batch.push_screen(
+        0,
+        Blend::Alpha,
+        SpriteInstance::sized(&white, Vec2::new(8.0, 8.0), Vec2::splat(8.0), 0.0)
+            .with_color([255, 0, 0, 255]),
+    );
+    // Text at (32, 8) in the built-in font at its raster size: a white "#" (solid rows).
+    atlas.debug_font().draw(&mut batch, "#", Vec2::new(32.0, 8.0), TextStyle::screen(16.0));
+
+    let img = render_with(&gpu, &mut renderer, &batch, &camera);
+    assert!(close(*img.get_pixel(8, 8), [255, 0, 0, 255]), "screen square: {:?}", img.get_pixel(8, 8));
+    assert!(close(*img.get_pixel(13, 8), [0, 0, 255, 255]), "square is 8 px: {:?}", img.get_pixel(13, 8));
+    let lit = (32..48)
+        .flat_map(|x| (8..24).map(move |y| (x, y)))
+        .filter(|&(x, y)| img.get_pixel(x, y)[1] > 200)
+        .count();
+    assert!(lit > 40, "the glyph drew {lit} white pixels");
+    assert!(close(*img.get_pixel(60, 28), [0, 0, 255, 255]), "background: {:?}", img.get_pixel(60, 28));
 }

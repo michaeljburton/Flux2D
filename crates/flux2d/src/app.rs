@@ -1,6 +1,12 @@
+use crate::overlay::DevOverlay;
 use crate::screenshot;
-use flux2d_core::{FixedTimestep, Input};
-use flux2d_render::{Atlas, Camera2D, FrameUpload, Gpu, SpriteBatch, SpriteRenderer, wgpu};
+use flux2d_audio::Audio;
+#[cfg(feature = "gamepad")]
+use flux2d_core::GamepadPoller;
+use flux2d_core::{FixedTimestep, Input, KeyCode, profile_frame, profile_scope};
+use flux2d_render::{
+    Atlas, Camera2D, Font, FrameUpload, Gpu, SpriteBatch, SpriteRegion, SpriteRenderer, wgpu,
+};
 use glam::Vec2;
 use std::sync::Arc;
 use std::time::Instant;
@@ -23,6 +29,10 @@ pub struct Config {
     pub update_hz: f64,
     /// Background colour, linear 0..1 RGBA.
     pub clear_color: [f64; 4],
+    /// Show the dev overlay from the start (F3 toggles it either way).
+    pub dev_overlay: bool,
+    /// Open the audio device. Off, `ctx.audio` is silent.
+    pub audio: bool,
 }
 
 impl Default for Config {
@@ -34,6 +44,8 @@ impl Default for Config {
             vsync: true,
             update_hz: 60.0,
             clear_color: [0.01, 0.01, 0.03, 1.0],
+            dev_overlay: false,
+            audio: true,
         }
     }
 }
@@ -55,16 +67,25 @@ pub struct FrameTimings {
     pub upload: FrameUpload,
 }
 
-/// Everything a game can reach: the GPU, input, the camera and timings.
+/// Everything a game can reach: the GPU, input, audio, the camera and timings.
 pub struct Context {
     pub gpu: Gpu,
     pub window: Arc<Window>,
+    /// Keyboard, mouse and gamepads. Edges (`key_pressed`...) read in `update` mean "since the
+    /// last update"; read anywhere else they mean "this frame".
     pub input: Input,
+    pub audio: Audio,
     pub camera: Camera2D,
     pub clear_color: [f64; 4],
     /// The last frame's timings.
     pub timings: FrameTimings,
+    /// The dev overlay (F3). Write extra lines into `overlay.text` during `update` or `draw`.
+    pub overlay: DevOverlay,
     renderer: SpriteRenderer,
+    #[cfg(feature = "gamepad")]
+    gamepads: GamepadPoller,
+    debug_font: Option<Font>,
+    white: Option<SpriteRegion>,
     surface: wgpu::Surface<'static>,
     surface_config: wgpu::SurfaceConfiguration,
     exit: bool,
@@ -81,6 +102,18 @@ impl Context {
     /// Draw every sprite from `atlas` from now on.
     pub fn set_atlas(&mut self, atlas: &Atlas) {
         self.renderer.set_atlas(&self.gpu, atlas);
+        self.debug_font = Some(atlas.debug_font().clone());
+        self.white = Some(atlas.white());
+    }
+
+    /// The current atlas's built-in 8x8 font (none before [`set_atlas`](Self::set_atlas)).
+    pub fn debug_font(&self) -> Option<&Font> {
+        self.debug_font.as_ref()
+    }
+
+    /// The current atlas's solid white sprite.
+    pub fn white(&self) -> Option<SpriteRegion> {
+        self.white
     }
 
     /// Ends the loop after this frame.
@@ -198,14 +231,27 @@ impl<G: Game, F: FnOnce(&mut Context) -> G> Runner<G, F> {
         };
         surface.configure(&gpu.device, &surface_config);
         let renderer = SpriteRenderer::new(&gpu, format);
+        #[cfg_attr(not(feature = "gamepad"), allow(unused_mut))]
+        let mut input = Input::default();
+        #[cfg(feature = "gamepad")]
+        let gamepads = GamepadPoller::new(&mut input);
+        let audio = if self.config.audio { Audio::new() } else { Audio::silent() };
+        flux2d_core::start_profiler();
+        let overlay = DevOverlay::new(self.config.dev_overlay, gpu.adapter_name());
         let mut ctx = Context {
             camera: Camera2D::new(Vec2::new(surface_config.width as f32, surface_config.height as f32)),
             gpu,
             window,
-            input: Input::default(),
+            input,
+            audio,
             clear_color: self.config.clear_color,
             timings: FrameTimings::default(),
+            overlay,
             renderer,
+            #[cfg(feature = "gamepad")]
+            gamepads,
+            debug_font: None,
+            white: None,
             surface,
             surface_config,
             exit: false,
@@ -286,16 +332,33 @@ impl<G: Game> State<G> {
             ctx.surface.configure(&ctx.gpu.device, &ctx.surface_config);
             ctx.vsync_changed = false;
         }
+        #[cfg(feature = "gamepad")]
+        ctx.gamepads.poll(&mut ctx.input);
+        if ctx.input.key_pressed(KeyCode::F3) {
+            ctx.overlay.visible = !ctx.overlay.visible;
+        }
+        ctx.overlay.text.clear();
 
         let steps = self.clock.advance(f64::from(frame_ms) / 1000.0);
         let dt = self.clock.step_seconds() as f32;
         for _ in 0..steps {
+            profile_scope!("update");
+            ctx.input.begin_step();
             self.game.update(ctx, dt);
+            ctx.input.end_step();
         }
         let t_update = Instant::now();
 
         self.batch.clear();
-        self.game.draw(ctx, &mut self.batch, self.clock.alpha());
+        {
+            profile_scope!("draw");
+            self.game.draw(ctx, &mut self.batch, self.clock.alpha());
+        }
+        if ctx.overlay.visible
+            && let (Some(font), Some(white)) = (&ctx.debug_font, &ctx.white)
+        {
+            ctx.overlay.draw(&mut self.batch, font, white, &ctx.timings);
+        }
         let t_draw = Instant::now();
 
         let surface_texture = match ctx.surface.get_current_texture() {
@@ -317,44 +380,52 @@ impl<G: Game> State<G> {
         };
         let t_acquired = Instant::now();
 
-        let upload = ctx.renderer.prepare(&ctx.gpu, &self.batch, &ctx.camera);
-        let view = surface_texture.texture.create_view(&Default::default());
-        let mut encoder = ctx
-            .gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flux2d frame") });
-        {
-            let [r, g, b, a] = ctx.clear_color;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("flux2d sprites"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                ..Default::default()
-            });
-            ctx.renderer.draw(&mut pass);
-        }
-        let shot = ctx.screenshot.take().map(|path| {
-            let buffer = screenshot::copy(&ctx.gpu, &mut encoder, &surface_texture.texture);
-            (path, buffer)
-        });
-        ctx.gpu.queue.submit([encoder.finish()]);
-        if let Some((path, Some(readback))) = shot {
-            match readback.save(&ctx.gpu, &path) {
-                Ok(()) => log::info!("saved screenshot {}", path.display()),
-                Err(e) => log::error!("screenshot {}: {e}", path.display()),
+        let upload = {
+            profile_scope!("upload");
+            let upload = ctx.renderer.prepare(&ctx.gpu, &self.batch, &ctx.camera);
+            let view = surface_texture.texture.create_view(&Default::default());
+            let mut encoder = ctx
+                .gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("flux2d frame") });
+            {
+                let [r, g, b, a] = ctx.clear_color;
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("flux2d sprites"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color { r, g, b, a }),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    ..Default::default()
+                });
+                ctx.renderer.draw(&mut pass);
             }
-        }
+            let shot = ctx.screenshot.take().map(|path| {
+                let buffer = screenshot::copy(&ctx.gpu, &mut encoder, &surface_texture.texture);
+                (path, buffer)
+            });
+            ctx.gpu.queue.submit([encoder.finish()]);
+            if let Some((path, Some(readback))) = shot {
+                match readback.save(&ctx.gpu, &path) {
+                    Ok(()) => log::info!("saved screenshot {}", path.display()),
+                    Err(e) => log::error!("screenshot {}: {e}", path.display()),
+                }
+            }
+            upload
+        };
         let t_submitted = Instant::now();
-        ctx.window.pre_present_notify();
-        ctx.gpu.queue.present(surface_texture);
+        {
+            profile_scope!("present");
+            ctx.window.pre_present_notify();
+            ctx.gpu.queue.present(surface_texture);
+        }
         let t_presented = Instant::now();
+        profile_frame!();
 
         let ms = |a: Instant, b: Instant| (b - a).as_secs_f32() * 1000.0;
         ctx.timings = FrameTimings {
@@ -366,6 +437,7 @@ impl<G: Game> State<G> {
             updates: steps,
             upload,
         };
+        ctx.overlay.record(frame_ms);
         self.game.frame_end(ctx);
         ctx.input.end_frame();
     }

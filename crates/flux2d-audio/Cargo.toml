@@ -1,0 +1,11 @@
+[package]
+name = "flux2d-audio"
+description = "Flux2D audio: sounds and music on mixer buses, built on kira"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+kira.workspace = true
+log.workspace = true
