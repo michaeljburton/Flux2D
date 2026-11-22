@@ -1,4 +1,4 @@
-use crate::{Atlas, Blend, Camera2D, DrawRun, Gpu, SpriteBatch, SpriteInstance};
+use crate::{Atlas, Blend, Camera2D, DrawRun, Gpu, Space, SpriteBatch, SpriteInstance};
 use std::mem::size_of;
 
 /// What one [`SpriteRenderer::prepare`] uploaded.
@@ -20,6 +20,8 @@ pub struct SpriteRenderer {
     instances: wgpu::Buffer,
     capacity: u64,
     runs: Vec<DrawRun>,
+    /// Byte offset of the screen-space matrix in `camera_buffer` (the world one is at 0).
+    screen_offset: u32,
 }
 
 const INSTANCE_ATTRIBUTES: [wgpu::VertexAttribute; 7] = wgpu::vertex_attr_array![
@@ -45,8 +47,8 @@ impl SpriteRenderer {
                 visibility: wgpu::ShaderStages::VERTEX,
                 ty: wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
+                    has_dynamic_offset: true,
+                    min_binding_size: wgpu::BufferSize::new(64),
                 },
                 count: None,
             }],
@@ -72,16 +74,25 @@ impl SpriteRenderer {
                 },
             ],
         });
+        // Two matrices, world then screen, each at an offset the device can bind dynamically.
+        let screen_offset = device.limits().min_uniform_buffer_offset_alignment.max(64);
         let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("flux2d camera"),
-            size: 64,
+            label: Some("flux2d cameras"),
+            size: u64::from(screen_offset) + 64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let camera_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("flux2d camera group"),
             layout: &camera_layout,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: camera_buffer.as_entire_binding() }],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer: &camera_buffer,
+                    offset: 0,
+                    size: wgpu::BufferSize::new(64),
+                }),
+            }],
         });
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("flux2d atlas sampler"),
@@ -162,6 +173,7 @@ impl SpriteRenderer {
             instances,
             capacity,
             runs: Vec::new(),
+            screen_offset,
         }
     }
 
@@ -190,11 +202,21 @@ impl SpriteRenderer {
     }
 
     /// Uploads the camera and every sprite in `batch`; call once per frame before [`draw`](Self::draw).
+    ///
+    /// [`Space::Screen`] sprites use window pixels: a camera at the centre of
+    /// `camera.viewport`, zoom 1, no rotation.
     pub fn prepare(&mut self, gpu: &Gpu, batch: &SpriteBatch, camera: &Camera2D) -> FrameUpload {
         gpu.queue.write_buffer(
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&camera.view_proj().to_cols_array()),
+        );
+        let screen =
+            Camera2D { position: camera.viewport * 0.5, zoom: 1.0, rotation: 0.0, viewport: camera.viewport };
+        gpu.queue.write_buffer(
+            &self.camera_buffer,
+            u64::from(self.screen_offset),
+            bytemuck::cast_slice(&screen.view_proj().to_cols_array()),
         );
         batch.runs(&mut self.runs);
         let count = self.runs.iter().map(|r| u64::from(r.count)).sum::<u64>();
@@ -213,7 +235,7 @@ impl SpriteRenderer {
             .write_buffer_with(&self.instances, 0, wgpu::BufferSize::new(bytes).expect("count > 0"))
             .expect("instance buffer is large enough");
         let mut offset = 0usize;
-        for (_, sprites) in batch.buckets() {
+        for (_, _, sprites) in batch.buckets() {
             let src: &[u8] = bytemuck::cast_slice(sprites);
             view.slice(offset..offset + src.len()).copy_from_slice(src);
             offset += src.len();
@@ -230,11 +252,19 @@ impl SpriteRenderer {
         if self.runs.is_empty() {
             return;
         }
-        pass.set_bind_group(0, &self.camera_group, &[]);
         pass.set_bind_group(1, textures, &[]);
         pass.set_vertex_buffer(0, self.instances.slice(..));
         let mut current = None;
+        let mut space = None;
         for run in &self.runs {
+            if space != Some(run.space) {
+                let offset = match run.space {
+                    Space::World => 0,
+                    Space::Screen => self.screen_offset,
+                };
+                pass.set_bind_group(0, &self.camera_group, &[offset]);
+                space = Some(run.space);
+            }
             if current != Some(run.blend) {
                 pass.set_pipeline(&self.pipelines[run.blend as usize]);
                 current = Some(run.blend);

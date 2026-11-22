@@ -10,3 +10,10 @@ publish.workspace = true
 winit.workspace = true
 glam.workspace = true
 log.workspace = true
+gilrs = { workspace = true, optional = true }
+tracy-client = { workspace = true, optional = true }
+
+[features]
+default = ["gamepad"]
+gamepad = ["dep:gilrs"]
+profile = ["dep:tracy-client"]

@@ -1,8 +1,11 @@
 use crate::Gpu;
+use crate::text::{self, Font, FontId, PendingFont};
 use glam::Vec2;
 use image::RgbaImage;
+use rayon::prelude::*;
+use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Transparent pixels kept round every sprite in the atlas, so smaller mip levels don't bleed
 /// one sprite's edge into its neighbour.
@@ -32,6 +35,7 @@ pub struct SpriteRegion {
 #[derive(Debug)]
 pub enum AtlasError {
     Image(String),
+    Font(String),
     TooBig { name: String, width: u32, height: u32, max: u32 },
     TooManyLayers { needed: u32, max: u32 },
 }
@@ -40,6 +44,7 @@ impl fmt::Display for AtlasError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             AtlasError::Image(e) => write!(f, "could not load image: {e}"),
+            AtlasError::Font(e) => write!(f, "could not load font: {e}"),
             AtlasError::TooBig { name, width, height, max } => {
                 write!(f, "{name} is {width}x{height}, larger than the {max} px atlas layer")
             }
@@ -52,10 +57,49 @@ impl fmt::Display for AtlasError {
 
 impl std::error::Error for AtlasError {}
 
-/// Collects sprite images, then packs them into one texture array with [`build`](Self::build).
+/// Collects sprite images and fonts, then packs them into one texture array with
+/// [`build`](Self::build).
+///
+/// Every atlas also gets a plain white sprite ([`Atlas::white`]) for rectangles, lines and
+/// bars, and the built-in 8x8 pixel font ([`Atlas::debug_font`]) for the dev overlay.
 #[derive(Default)]
 pub struct AtlasBuilder {
     images: Vec<(String, RgbaImage)>,
+    fonts: Vec<PendingFont>,
+}
+
+/// Image file extensions [`AtlasBuilder::add_dir`] picks up.
+pub const IMAGE_EXTENSIONS: [&str; 4] = ["png", "jpg", "jpeg", "webp"];
+
+fn load_image(path: &Path, max_size: Option<u32>) -> Result<RgbaImage, AtlasError> {
+    let mut img =
+        image::open(path).map_err(|e| AtlasError::Image(format!("{}: {e}", path.display())))?.into_rgba8();
+    if let Some(max) = max_size {
+        let (w, h) = img.dimensions();
+        if w > max || h > max {
+            let scale = max as f32 / w.max(h) as f32;
+            let nw = ((w as f32 * scale).round() as u32).max(1);
+            let nh = ((h as f32 * scale).round() as u32).max(1);
+            img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
+        }
+    }
+    Ok(img)
+}
+
+fn collect_images(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_images(&path, out)?;
+        } else if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| IMAGE_EXTENSIONS.iter().any(|x| x.eq_ignore_ascii_case(e)))
+        {
+            out.push(path);
+        }
+    }
+    Ok(())
 }
 
 impl AtlasBuilder {
@@ -77,19 +121,75 @@ impl AtlasBuilder {
         max_size: Option<u32>,
     ) -> Result<SpriteId, AtlasError> {
         let path = path.as_ref();
-        let mut img = image::open(path)
-            .map_err(|e| AtlasError::Image(format!("{}: {e}", path.display())))?
-            .into_rgba8();
-        if let Some(max) = max_size {
-            let (w, h) = img.dimensions();
-            if w > max || h > max {
-                let scale = max as f32 / w.max(h) as f32;
-                let nw = ((w as f32 * scale).round() as u32).max(1);
-                let nh = ((h as f32 * scale).round() as u32).max(1);
-                img = image::imageops::resize(&img, nw, nh, image::imageops::FilterType::Triangle);
-            }
-        }
+        let img = load_image(path, max_size)?;
         Ok(self.add(path.display().to_string(), img))
+    }
+
+    /// Loads many image files at once, decoding them on every core. Each is named by its path
+    /// as given. Results are in the same order as `paths`.
+    pub fn add_files<P: AsRef<Path> + Sync>(
+        &mut self,
+        paths: &[P],
+        max_size: Option<u32>,
+    ) -> Vec<Result<SpriteId, AtlasError>> {
+        let decoded: Vec<_> = paths.par_iter().map(|p| load_image(p.as_ref(), max_size)).collect();
+        decoded
+            .into_iter()
+            .zip(paths)
+            .map(|(img, p)| img.map(|img| self.add(p.as_ref().display().to_string(), img)))
+            .collect()
+    }
+
+    /// Loads every image under `dir` (and its subfolders) in parallel. Each sprite is named by
+    /// its path relative to `dir` with `/` separators (`"player/ship.png"`), so
+    /// [`Atlas::find`] can look it up. Returns the names and ids, sorted by name.
+    pub fn add_dir(
+        &mut self,
+        dir: impl AsRef<Path>,
+        max_size: Option<u32>,
+    ) -> Result<Vec<(String, SpriteId)>, AtlasError> {
+        let dir = dir.as_ref();
+        let mut paths = Vec::new();
+        collect_images(dir, &mut paths).map_err(|e| AtlasError::Image(format!("{}: {e}", dir.display())))?;
+        paths.sort();
+        let decoded: Vec<_> = paths.par_iter().map(|p| load_image(p, max_size)).collect();
+        let mut out = Vec::with_capacity(paths.len());
+        for (path, img) in paths.iter().zip(decoded) {
+            let name = path
+                .strip_prefix(dir)
+                .unwrap_or(path)
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/");
+            let id = self.add(name.clone(), img?);
+            out.push((name, id));
+        }
+        Ok(out)
+    }
+
+    /// Bakes a TrueType / OpenType font's `chars` (e.g. [`text::LATIN`]) into the atlas at
+    /// `px` pixels. Text drawn at `px` is pixel-exact; smaller sizes use the mip levels, larger
+    /// ones get soft, so pick the largest size the game draws it at.
+    pub fn add_font(&mut self, name: &str, data: &[u8], px: f32, chars: &str) -> Result<FontId, AtlasError> {
+        let pending = text::rasterize_ttf(name, data, px, chars, |n, img| self.add(n, img))
+            .map_err(AtlasError::Font)?;
+        self.fonts.push(pending);
+        Ok(FontId(self.fonts.len() as u32 - 1))
+    }
+
+    /// [`add_font`](Self::add_font) from a `.ttf` / `.otf` file.
+    pub fn add_font_file(
+        &mut self,
+        path: impl AsRef<Path>,
+        px: f32,
+        chars: &str,
+    ) -> Result<FontId, AtlasError> {
+        let path = path.as_ref();
+        let data = std::fs::read(path).map_err(|e| AtlasError::Font(format!("{}: {e}", path.display())))?;
+        let name =
+            path.file_stem().map_or_else(|| path.display().to_string(), |s| s.to_string_lossy().into_owned());
+        self.add_font(&name, &data, px, chars)
     }
 
     pub fn len(&self) -> usize {
@@ -101,7 +201,13 @@ impl AtlasBuilder {
     }
 
     /// Packs every image into texture array layers, builds mip levels and uploads them.
-    pub fn build(self, gpu: &Gpu) -> Result<Atlas, AtlasError> {
+    pub fn build(mut self, gpu: &Gpu) -> Result<Atlas, AtlasError> {
+        let white = self.add("white", RgbaImage::from_pixel(8, 8, image::Rgba([255; 4])));
+        let debug = text::debug_font(|n, img| {
+            self.images.push((n, img));
+            SpriteId(self.images.len() as u32 - 1)
+        });
+        self.fonts.push(debug);
         let limits = gpu.device.limits();
         let max_layer = MAX_LAYER.min(limits.max_texture_dimension_2d);
         let max_layers = limits.max_texture_array_layers;
@@ -188,8 +294,19 @@ impl AtlasBuilder {
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             ..Default::default()
         });
-        let names = self.images.into_iter().map(|(n, _)| n).collect();
-        Ok(Atlas { texture, view, regions, names, layer_size, layer_count, mip_count })
+        // The white sprite samples only its middle texels, so filtering never reaches the
+        // transparent padding: a solid 1x1 unit, scaled to any rectangle.
+        let w = regions[white.0 as usize];
+        let inset = 2.0 * inv;
+        regions[white.0 as usize] = SpriteRegion {
+            layer: w.layer,
+            uv: [w.uv[0] + inset, w.uv[1] + inset, w.uv[2] - inset, w.uv[3] - inset],
+            size: Vec2::ONE,
+        };
+        let fonts: Vec<Font> = self.fonts.into_iter().map(|f| Font::resolve(f, &regions)).collect();
+        let names: Vec<String> = self.images.into_iter().map(|(n, _)| n).collect();
+        let by_name = names.iter().enumerate().map(|(i, n)| (n.clone(), SpriteId(i as u32))).collect();
+        Ok(Atlas { texture, view, regions, names, by_name, fonts, white, layer_size, layer_count, mip_count })
     }
 }
 
@@ -199,6 +316,9 @@ pub struct Atlas {
     pub view: wgpu::TextureView,
     regions: Vec<SpriteRegion>,
     names: Vec<String>,
+    by_name: HashMap<String, SpriteId>,
+    fonts: Vec<Font>,
+    white: SpriteId,
     layer_size: u32,
     layer_count: u32,
     mip_count: u32,
@@ -215,6 +335,26 @@ impl Atlas {
 
     pub fn name(&self, id: SpriteId) -> &str {
         &self.names[id.0 as usize]
+    }
+
+    /// The sprite added under `name` ([`AtlasBuilder::add_dir`] names them by relative path).
+    pub fn find(&self, name: &str) -> Option<SpriteId> {
+        self.by_name.get(name).copied()
+    }
+
+    /// A font added with [`AtlasBuilder::add_font`].
+    pub fn font(&self, id: FontId) -> &Font {
+        &self.fonts[id.0 as usize]
+    }
+
+    /// The built-in 8x8 pixel font, rasterised at 16 px; in every atlas.
+    pub fn debug_font(&self) -> &Font {
+        self.fonts.last().expect("every atlas has the debug font")
+    }
+
+    /// A solid white 1x1 sprite: tint and size it for rectangles, bars and lines.
+    pub fn white(&self) -> SpriteRegion {
+        self.regions[self.white.0 as usize]
     }
 
     pub fn len(&self) -> usize {

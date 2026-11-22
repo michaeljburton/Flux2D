@@ -1,0 +1,13 @@
+[package]
+name = "flux2d-fx"
+description = "Flux2D effects: particle pools and trails drawn as sprites"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+flux2d-core.workspace = true
+flux2d-render.workspace = true
+glam.workspace = true
+rayon.workspace = true

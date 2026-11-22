@@ -1,0 +1,10 @@
+[package]
+name = "flux2d-physics"
+description = "Flux2D collision: a spatial hash grid of circles and boxes with layers, masks and raycasts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+glam.workspace = true

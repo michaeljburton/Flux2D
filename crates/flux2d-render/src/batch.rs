@@ -12,6 +12,18 @@ pub enum Blend {
     Additive = 1,
 }
 
+/// Which camera a sprite is drawn with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum Space {
+    /// World units, through the game's [`Camera2D`](crate::Camera2D).
+    #[default]
+    World = 0,
+    /// Window pixels with a top-left origin, ignoring the camera: HUD, menus, the dev overlay.
+    /// Drawn after (on top of) every world sprite.
+    Screen = 1,
+}
+
 /// One sprite as the GPU sees it: 48 bytes, no pointers, no per-sprite objects.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Pod, Zeroable)]
@@ -72,12 +84,15 @@ impl SpriteInstance {
 
 /// Number of draw layers. Layer 0 is drawn first (furthest back).
 pub const LAYERS: usize = 256;
-const BUCKETS: usize = LAYERS * 2;
+/// Buckets per space: one per (layer, blend).
+const PER_SPACE: usize = LAYERS * 2;
+const BUCKETS: usize = PER_SPACE * 2;
 
 /// A frame's worth of sprites, kept in order without sorting.
 ///
-/// Sprites go into one bucket per (draw layer, blend mode). Buckets are drawn layer by layer,
-/// alpha before additive within a layer, and within a bucket in the order they were added.
+/// Sprites go into one bucket per (space, draw layer, blend mode). World sprites are drawn
+/// first, then screen sprites; within a space layer by layer, alpha before additive within a
+/// layer, and within a bucket in the order they were added.
 /// Buckets keep their memory between frames, so a steady scene allocates nothing.
 pub struct SpriteBatch {
     buckets: Vec<Vec<SpriteInstance>>,
@@ -93,6 +108,7 @@ impl Default for SpriteBatch {
 /// A contiguous range of the uploaded instances drawn with one blend mode: one draw call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DrawRun {
+    pub space: Space,
     pub blend: Blend,
     pub start: u32,
     pub count: u32,
@@ -104,27 +120,49 @@ impl SpriteBatch {
     }
 
     #[inline]
-    fn bucket(&mut self, layer: u8, blend: Blend) -> &mut Vec<SpriteInstance> {
-        let idx = usize::from(layer) * 2 + blend as usize;
+    fn bucket(&mut self, space: Space, layer: u8, blend: Blend) -> &mut Vec<SpriteInstance> {
+        let idx = space as usize * PER_SPACE + usize::from(layer) * 2 + blend as usize;
         self.used[idx / 64] |= 1 << (idx % 64);
         &mut self.buckets[idx]
     }
 
-    /// Adds one sprite.
+    /// Adds one world sprite.
     #[inline]
     pub fn push(&mut self, layer: u8, blend: Blend, sprite: SpriteInstance) {
-        self.bucket(layer, blend).push(sprite);
+        self.bucket(Space::World, layer, blend).push(sprite);
     }
 
-    /// Adds many sprites.
+    /// Adds one sprite in `space`.
+    #[inline]
+    pub fn push_in(&mut self, space: Space, layer: u8, blend: Blend, sprite: SpriteInstance) {
+        self.bucket(space, layer, blend).push(sprite);
+    }
+
+    /// Adds one screen-space sprite (window pixels, top-left origin, drawn over the world).
+    #[inline]
+    pub fn push_screen(&mut self, layer: u8, blend: Blend, sprite: SpriteInstance) {
+        self.bucket(Space::Screen, layer, blend).push(sprite);
+    }
+
+    /// Adds many world sprites.
     pub fn extend(&mut self, layer: u8, blend: Blend, sprites: &[SpriteInstance]) {
-        self.bucket(layer, blend).extend_from_slice(sprites);
+        self.bucket(Space::World, layer, blend).extend_from_slice(sprites);
     }
 
-    /// Makes room for `count` sprites and returns them to fill in, e.g. from several threads
-    /// with `rayon`'s `par_iter_mut`. Fill every one: they start zeroed (invisible).
+    /// Adds many sprites in `space`.
+    pub fn extend_in(&mut self, space: Space, layer: u8, blend: Blend, sprites: &[SpriteInstance]) {
+        self.bucket(space, layer, blend).extend_from_slice(sprites);
+    }
+
+    /// Makes room for `count` world sprites and returns them to fill in, e.g. from several
+    /// threads with `rayon`'s `par_iter_mut`. Fill every one: they start zeroed (invisible).
     pub fn alloc(&mut self, layer: u8, blend: Blend, count: usize) -> &mut [SpriteInstance] {
-        let bucket = self.bucket(layer, blend);
+        self.alloc_in(Space::World, layer, blend, count)
+    }
+
+    /// [`alloc`](Self::alloc) in `space`.
+    pub fn alloc_in(&mut self, space: Space, layer: u8, blend: Blend, count: usize) -> &mut [SpriteInstance] {
+        let bucket = self.bucket(space, layer, blend);
         let start = bucket.len();
         bucket.resize(start + count, SpriteInstance::default());
         &mut bucket[start..]
@@ -165,24 +203,25 @@ impl SpriteBatch {
         })
     }
 
-    /// The non-empty buckets in draw order, with their blend mode.
-    pub fn buckets(&self) -> impl Iterator<Item = (Blend, &[SpriteInstance])> + '_ {
+    /// The non-empty buckets in draw order, with their space and blend mode.
+    pub fn buckets(&self) -> impl Iterator<Item = (Space, Blend, &[SpriteInstance])> + '_ {
         self.used_indices().filter(|&i| !self.buckets[i].is_empty()).map(|i| {
+            let space = if i < PER_SPACE { Space::World } else { Space::Screen };
             let blend = if i % 2 == 0 { Blend::Alpha } else { Blend::Additive };
-            (blend, self.buckets[i].as_slice())
+            (space, blend, self.buckets[i].as_slice())
         })
     }
 
     /// The draw calls for this batch: buckets laid end to end, merging neighbours that share
-    /// a blend mode.
+    /// a space and blend mode.
     pub fn runs(&self, out: &mut Vec<DrawRun>) {
         out.clear();
         let mut start = 0u32;
-        for (blend, sprites) in self.buckets() {
+        for (space, blend, sprites) in self.buckets() {
             let count = sprites.len() as u32;
             match out.last_mut() {
-                Some(run) if run.blend == blend => run.count += count,
-                _ => out.push(DrawRun { blend, start, count }),
+                Some(run) if run.blend == blend && run.space == space => run.count += count,
+                _ => out.push(DrawRun { space, blend, start, count }),
             }
             start += count;
         }
@@ -204,7 +243,7 @@ mod tests {
         b.push(5, Blend::Alpha, s(2.0));
         b.push(0, Blend::Alpha, s(3.0));
         b.push(200, Blend::Alpha, s(4.0));
-        let order: Vec<f32> = b.buckets().flat_map(|(_, v)| v.iter().map(|i| i.position[0])).collect();
+        let order: Vec<f32> = b.buckets().flat_map(|(_, _, v)| v.iter().map(|i| i.position[0])).collect();
         assert_eq!(order, vec![3.0, 2.0, 1.0, 4.0]);
     }
 
@@ -221,12 +260,27 @@ mod tests {
         assert_eq!(
             runs,
             vec![
-                DrawRun { blend: Blend::Alpha, start: 0, count: 15 },
-                DrawRun { blend: Blend::Additive, start: 15, count: 10 },
-                DrawRun { blend: Blend::Alpha, start: 25, count: 1 },
+                DrawRun { space: Space::World, blend: Blend::Alpha, start: 0, count: 15 },
+                DrawRun { space: Space::World, blend: Blend::Additive, start: 15, count: 10 },
+                DrawRun { space: Space::World, blend: Blend::Alpha, start: 25, count: 1 },
             ]
         );
         assert_eq!(b.len(), 26);
+    }
+
+    #[test]
+    fn screen_sprites_come_after_the_world() {
+        let mut b = SpriteBatch::new();
+        b.push_screen(0, Blend::Alpha, s(1.0));
+        b.push(255, Blend::Additive, s(2.0));
+        b.push(0, Blend::Alpha, s(3.0));
+        b.push_in(Space::Screen, 9, Blend::Alpha, s(4.0));
+        let order: Vec<f32> = b.buckets().flat_map(|(_, _, v)| v.iter().map(|i| i.position[0])).collect();
+        assert_eq!(order, vec![3.0, 2.0, 1.0, 4.0]);
+        let mut runs = Vec::new();
+        b.runs(&mut runs);
+        assert_eq!(runs.len(), 3, "screen alpha doesn't merge with world additive: {runs:?}");
+        assert_eq!(runs[2], DrawRun { space: Space::Screen, blend: Blend::Alpha, start: 2, count: 2 });
     }
 
     #[test]
